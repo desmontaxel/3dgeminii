@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebAR Interactive Particle System</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            color: #fff;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        #container {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        /* Video mirrored */
+        #webcam {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            transform: scaleX(-1);
+            /* Mirror the video */
+            z-index: 1;
+        }
+
+        /* Canvas on top */
+        #output_canvas {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            z-index: 2;
+            pointer-events: none;
+        }
+
+        #loading {
+            position: absolute;
+            z-index: 10;
+            font-size: 24px;
+            font-weight: 300;
+            text-align: center;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 20px 40px;
+            border-radius: 10px;
+            backdrop-filter: blur(5px);
+            transition: opacity 0.5s ease;
+        }
+
+        .spinner {
+            display: inline-block;
+            width: 30px;
+            height: 30px;
+            border: 3px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            border-top-color: #fff;
+            animation: spin 1s ease-in-out infinite;
+            margin-right: 10px;
+            vertical-align: middle;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        #gesture-label {
+            position: absolute;
+            bottom: 50px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 10;
+            font-size: 20px;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 10px 20px;
+            border-radius: 20px;
+            display: none;
+            backdrop-filter: blur(5px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        #footer {
+            position: absolute;
+            bottom: 10px;
+            width: 100%;
+            text-align: center;
+            z-index: 10;
+            font-size: 14px;
+            color: rgba(255, 255, 255, 0.7);
+            pointer-events: none;
+            text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.8);
+        }
+    </style>
+    <!-- MediaPipe Hands -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js"
+        crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"
+        crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <!-- Three.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r134/three.min.js"></script>
+</head>
+
+<body>
+    <div id="container">
+        <video id="webcam" autoplay playsinline></video>
+        <canvas id="output_canvas"></canvas>
+        <div id="loading">
+            <div class="spinner"></div> Loading AI Models & Camera...
+        </div>
+        <div id="gesture-label">None</div>
+        <div id="footer">© 2026 Desmond Axel Osbert</div>
+    </div>
+
+    <script>
+        const videoElement = document.getElementById('webcam');
+        const canvasElement = document.getElementById('output_canvas');
+        const loadingElement = document.getElementById('loading');
+        const gestureLabel = document.getElementById('gesture-label');
+
+        // --- Fullscreen on Tap (For Mobile) ---
+        // Browsers require user interaction to enter fullscreen
+        document.body.addEventListener('click', () => {
+            const el = document.documentElement;
+            if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+                if (el.requestFullscreen) el.requestFullscreen();
+                else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+                else if (el.msRequestFullscreen) el.msRequestFullscreen();
+            }
+        });
+
+        // --- Three.js Setup ---
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.z = 10;
+
+        const renderer = new THREE.WebGLRenderer({ canvas: canvasElement, alpha: true, antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+
+        let videoAspect = 16 / 9; // default
+        videoElement.addEventListener('loadedmetadata', () => {
+            videoAspect = videoElement.videoWidth / videoElement.videoHeight;
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- Particle Effects Objects ---
+        let currentGesture = 'none';
+        let currentEffect = null;
+
+        // Helper to get world position from normalized MediaPipe coords (0 to 1)
+        function getWorldPos(x, y, zOffset = 0) {
+            let windowAspect = window.innerWidth / window.innerHeight;
+            let scaleX = 1;
+            let scaleY = 1;
+
+            // Adjust for object-fit: cover cropping
+            if (windowAspect > videoAspect) {
+                scaleY = windowAspect / videoAspect;
+            } else {
+                scaleX = videoAspect / windowAspect;
+            }
+
+            let nx = (x * 2) - 1;
+            let ny = -(y * 2) + 1;
+
+            nx = nx * scaleX;
+            ny = ny * scaleY;
+
+            nx = -nx; // Mirror X because webcam is flipped horizontally
+
+            const vec = new THREE.Vector3(nx, ny, 0.5);
+            vec.unproject(camera);
+            vec.sub(camera.position).normalize();
+            const distance = -camera.position.z / vec.z;
+            const pos = new THREE.Vector3().copy(camera.position).add(vec.multiplyScalar(distance));
+            pos.z += zOffset;
+            return pos;
+        }
+
+        // 1. Text Particles
+        function createTextParticles(text, colorHex = 0x00d4ff) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 512;
+            canvas.height = 128;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.font = 'bold 60px "Segoe UI", Arial';
+            ctx.fillStyle = '#ffffff';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+
+            const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+            const positions = [];
+            const colors = [];
+            const color = new THREE.Color(colorHex);
+
+            for (let y = 0; y < canvas.height; y += 2) {
+                for (let x = 0; x < canvas.width; x += 2) {
+                    const idx = (y * canvas.width + x) * 4;
+                    if (imgData[idx] > 128) {
+                        positions.push((x - canvas.width / 2) * 0.015, -(y - canvas.height / 2) * 0.015, (Math.random() - 0.5) * 0.2);
+                        colors.push(color.r, color.g, color.b);
+                    }
+                }
+            }
+            const geometry = new THREE.BufferGeometry();
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+
+            const material = new THREE.PointsMaterial({
+                size: 0.05,
+                vertexColors: true,
+                transparent: true,
+                opacity: 0.9,
+                blending: THREE.AdditiveBlending
+            });
+            const points = new THREE.Points(geometry, material);
+            const group = new THREE.Group();
+            group.add(points);
+
+            group.userData = {
+                update: (time) => {
+                    const pos = geometry.attributes.position.array;
+                    for (let i = 0; i < pos.length; i += 3) {
+                        pos[i + 2] = Math.sin(time * 3 + pos[i] * 5) * 0.1;
+                    }
+                    geometry.attributes.position.needsUpdate = true;
+                }
+            };
+            return group;
+        }
+
+        // 2. 3D Planet with rings
+        function createPlanet() {
+            const group = new THREE.Group();
+
+            // Sphere
+            const sPositions = [];
+            const sColors = [];
+            const sColor = new THREE.Color(0x0055ff);
+            for (let i = 0; i < 800; i++) {
+                const r = 1.0 * Math.cbrt(Math.random());
+                const theta = Math.random() * 2 * Math.PI;
+                const phi = Math.acos(2 * Math.random() - 1);
+                sPositions.push(r * Math.sin(phi) * Math.cos(theta), r * Math.sin(phi) * Math.sin(theta), r * Math.cos(phi));
+                sColors.push(sColor.r + Math.random() * 0.2, sColor.g + Math.random() * 0.2, sColor.b + Math.random() * 0.2);
+            }
+            const sphereGeo = new THREE.BufferGeometry();
+            sphereGeo.setAttribute('position', new THREE.Float32BufferAttribute(sPositions, 3));
+            sphereGeo.setAttribute('color', new THREE.Float32BufferAttribute(sColors, 3));
+            const sphereMat = new THREE.PointsMaterial({ size: 0.04, vertexColors: true, blending: THREE.AdditiveBlending, transparent: true });
+            const sphere = new THREE.Points(sphereGeo, sphereMat);
+            group.add(sphere);
+
+            // Rings
+            const rPositions = [];
+            for (let i = 0; i < 1500; i++) {
+                const angle = Math.random() * Math.PI * 2;
+                const r = 1.2 + Math.random() * 0.8;
+                rPositions.push(Math.cos(angle) * r, (Math.random() - 0.5) * 0.1, Math.sin(angle) * r);
+            }
+            const ringGeo = new THREE.BufferGeometry();
+            ringGeo.setAttribute('position', new THREE.Float32BufferAttribute(rPositions, 3));
+            const ringMat = new THREE.PointsMaterial({ color: 0x00aaff, size: 0.03, blending: THREE.AdditiveBlending, transparent: true });
+            const ring = new THREE.Points(ringGeo, ringMat);
+            ring.rotation.x = Math.PI / 2 - 0.2;
+            group.add(ring);
+
+            group.userData = {
+                update: (time) => {
+                    sphere.rotation.y = time * 0.5;
+                    ring.rotation.z = -time * 0.2;
+                }
+            };
+            return group;
+        }
+
+        // 3. Heart outline
+        function createHeart() {
+            const positions = [];
+            for (let i = 0; i < 300; i++) {
+                const t = (i / 300) * Math.PI * 2;
+                const x = 16 * Math.pow(Math.sin(t), 3);
+                const y = 13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t);
+                positions.push(x * 0.08, y * 0.08, 0);
+            }
+            const geo = new THREE.BufferGeometry();
+            geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            const mat = new THREE.PointsMaterial({ color: 0x00ff44, size: 0.08, blending: THREE.AdditiveBlending, transparent: true });
+            const points = new THREE.Points(geo, mat);
+
+            const group = new THREE.Group();
+            group.add(points);
+
+            group.userData = {
+                update: (time) => {
+                    const scale = 1.0 + Math.sin(time * 5) * 0.1;
+                    points.scale.set(scale, scale, scale);
+                }
+            };
+            return group;
+        }
+
+        const effects = {
+            'peace': createTextParticles('i love you', 0x00d4ff),
+            'fist': createPlanet(),
+            'heart': createHeart(),
+            'shaka': createTextParticles("ALLSTAR'PK 26", 0xffd700)
+        };
+
+        // --- Gesture Detection ---
+        function detectGesture(landmarks) {
+            const dist = (p1, p2) => Math.hypot(p1.x - p2.x, p1.y - p2.y);
+            const wrist = landmarks[0];
+
+            const isExtended = (tipIdx, baseIdx) => {
+                return dist(wrist, landmarks[tipIdx]) > dist(wrist, landmarks[baseIdx]) * 1.2;
+            };
+
+            const thumbExtended = isExtended(4, 2);
+            const indexExtended = isExtended(8, 5);
+            const middleExtended = isExtended(12, 9);
+            const ringExtended = isExtended(16, 13);
+            const pinkyExtended = isExtended(20, 17);
+
+            const thumbIndexDist = dist(landmarks[4], landmarks[8]);
+
+            if (thumbIndexDist < 0.05 && !middleExtended && !ringExtended && !pinkyExtended) {
+                return 'heart';
+            }
+            if (thumbExtended && pinkyExtended && !indexExtended && !middleExtended && !ringExtended) {
+                return 'shaka';
+            }
+            if (indexExtended && middleExtended && !ringExtended && !pinkyExtended) {
+                return 'peace';
+            }
+            if (!indexExtended && !middleExtended && !ringExtended && !pinkyExtended) {
+                return 'fist';
+            }
+
+            return 'none';
+        }
+
+        // --- MediaPipe Initialization ---
+        const hands = new Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.7,
+            minTrackingConfidence: 0.7
+        });
+
+        hands.onResults((results) => {
+            if (loadingElement.style.opacity !== '0') {
+                loadingElement.style.opacity = '0';
+                setTimeout(() => loadingElement.style.display = 'none', 500);
+                gestureLabel.style.display = 'block';
+            }
+
+            let detectedGesture = 'none';
+            let handCenter = null;
+
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const landmarks = results.multiHandLandmarks[0];
+                detectedGesture = detectGesture(landmarks);
+
+                if (detectedGesture === 'peace') {
+                    handCenter = getWorldPos((landmarks[8].x + landmarks[12].x) / 2, (landmarks[8].y + landmarks[12].y) / 2 - 0.1);
+                } else if (detectedGesture === 'fist') {
+                    handCenter = getWorldPos(landmarks[9].x, landmarks[9].y - 0.1);
+                } else if (detectedGesture === 'heart') {
+                    handCenter = getWorldPos((landmarks[4].x + landmarks[8].x) / 2, (landmarks[4].y + landmarks[8].y) / 2);
+                } else if (detectedGesture === 'shaka') {
+                    handCenter = getWorldPos(landmarks[0].x, landmarks[0].y - 0.2);
+                }
+            }
+
+            gestureLabel.innerText = 'Gesture: ' + (detectedGesture === 'none' ? 'None' : detectedGesture.toUpperCase());
+
+            if (detectedGesture !== currentGesture) {
+                if (currentEffect) {
+                    scene.remove(currentEffect);
+                    currentEffect = null;
+                }
+                if (detectedGesture !== 'none') {
+                    currentEffect = effects[detectedGesture];
+                    // Reset position immediately when switching
+                    if (handCenter) currentEffect.position.copy(handCenter);
+                    scene.add(currentEffect);
+                }
+                currentGesture = detectedGesture;
+            }
+
+            if (currentEffect && handCenter) {
+                currentEffect.position.lerp(handCenter, 0.2);
+            }
+        });
+
+        const cameraUtils = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({ image: videoElement });
+            },
+            width: 1280,
+            height: 720
+        });
+        cameraUtils.start();
+
+        // --- Render Loop ---
+        const clock = new THREE.Clock();
+        function animate() {
+            requestAnimationFrame(animate);
+            const time = clock.getElapsedTime();
+
+            if (currentEffect && currentEffect.userData.update) {
+                currentEffect.userData.update(time);
+            }
+
+            renderer.render(scene, camera);
+        }
+        animate();
+    </script>
+</body>
+
+</html>
